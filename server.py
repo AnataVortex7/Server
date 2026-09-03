@@ -72,13 +72,11 @@ async def tg_webhook(request):
     
     user_bot_tokens[chat_id] = bot_token
 
-    # Access control
     if allowed_users and user_id not in allowed_users:
         if text == "/start":
             await send_tg_message(bot_token, chat_id, f"❌ You are not authorized. Your ID is: {user_id}")
         return web.Response(text="OK")
 
-    # Owner commands
     if user_id == OWNER_ID and text.startswith("/allow "):
         new_user = text.split(" ")[1].strip()
         allowed_users.add(new_user)
@@ -120,9 +118,38 @@ async def tg_webhook(request):
     await sio.emit("user_message", {"chat_id": chat_id, "text": text}, to=worker_sid)
     return web.Response(text="OK")
 
+async def home_page(request):
+    html = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Master Server Status</title>
+        <style>
+            body {{ font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: #0f172a; color: #fff; text-align: center; padding-top: 100px; }}
+            .container {{ max-width: 600px; margin: auto; background: #1e293b; padding: 40px; border-radius: 12px; box-shadow: 0 4px 15px rgba(0,0,0,0.5); }}
+            h1 {{ color: #10b981; }}
+            .status {{ font-size: 24px; font-weight: bold; margin-bottom: 20px; }}
+            .nodes {{ font-size: 18px; color: #94a3b8; }}
+            .footer {{ margin-top: 40px; font-size: 12px; color: #475569; }}
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <h1>🚀 Master Server is Online!</h1>
+            <div class="status">✅ SYSTEM ACTIVE</div>
+            <div class="nodes">Currently <b>{len(workers)}</b> AI Worker Nodes are connected.</div>
+            <p style="margin-top:20px; color:#38bdf8;">UptimeRobot Monitor can safely check this page.</p>
+            <div class="footer">Powered by Next-Gen Multi-Node Architecture</div>
+        </div>
+    </body>
+    </html>
+    """
+    return web.Response(text=html, content_type='text/html')
+
 async def on_startup(app):
     asyncio.create_task(set_webhooks())
 
+app.router.add_get('/', home_page)
 app.router.add_post('/webhook/{bot_token}', tg_webhook)
 app.on_startup.append(on_startup)
 
