@@ -657,16 +657,24 @@ def handle_gateway_client(client, internal_port):
 
         # Forward all other traffic (/, /socket.io, APIs, WebSockets) to internal server.py
         backend = None
-        for _ in range(8):
+        for target_host in ["localhost", "127.0.0.1", "::1"]:
             try:
-                backend = socket.create_connection(("127.0.0.1", internal_port), timeout=2)
-                break
+                backend = socket.create_connection((target_host, internal_port), timeout=1)
+                if backend:
+                    break
             except Exception:
-                time.sleep(0.5)
+                pass
 
         if backend is None:
-            msg = b"HTTP/1.1 503 Service Unavailable\r\nRetry-After: 3\r\nContent-Length: 26\r\n\r\nBackend server starting..."
-            client.sendall(msg)
+            # If backend service is still starting or failed, serve the APM Dashboard instead of raw 503!
+            html_bytes = get_dashboard_html().encode("utf-8")
+            resp = (
+                b"HTTP/1.1 200 OK\r\n"
+                b"Content-Type: text/html; charset=utf-8\r\n"
+                b"Content-Length: " + str(len(html_bytes)).encode() + b"\r\n"
+                b"Connection: close\r\n\r\n" + html_bytes
+            )
+            client.sendall(resp)
             client.close()
             return
 
