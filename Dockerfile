@@ -5,5 +5,5 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
 ENV PORT=10000
 EXPOSE 10000
-# CMD ["python", "server.py"]
-CMD sh -c "python server.py & python apm.py"
+CMD ["python", "apm.py"]
+# CMD sh -c "python server.py & python apm.py"
