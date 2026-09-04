@@ -1,3 +1,4 @@
 FROM python:3.11-slim
-COPY
+COPY requirements.txt .
+COPY . .
 CMD ["python", "apm.py"]
