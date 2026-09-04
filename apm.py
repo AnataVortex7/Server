@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-apm.py - Universal Autonomous Supervisor, Watchdog & Anti-Rollback Engine
-========================================================================
+apm.py - Universal Autonomous Supervisor, Anti-Rollback & Smart Gateway Engine
+==============================================================================
 • ZERO DEPENDENCIES: 100% Python Standard Library (No requirements.txt, No Docker needed).
-• PRIVACY FIRST: Public web dashboard is a clean health-check only (NO public rollback/download).
+• SMART GATEWAY:
+    - If server.py exists, it runs server.py on internal port 8000 (Zero changes to server.py).
+    - Port 10000 routes /apm to APM Dashboard, and all other traffic (/, socket.io) to server.py!
+    - Full WebSocket & Socket.IO bidirectional proxy support.
 • DYNAMIC TOKEN:
-    - In Cloud/Docker: Reads from TELEGRAM_BOT_TOKEN environment variable.
-    - In Local/Termux: Prompts user interactively if not already saved, and saves to ~/.bot_token.
-    - NO hardcoded default token.
+    - Cloud/Docker: Reads from TELEGRAM_BOT_TOKEN or BOT_TOKENS environment variables.
+    - Local/Termux: Asks user interactively if not saved, and saves to ~/.bot_token.
 • TELEGRAM CONTROL: Full rollback and file download controlled via Telegram / Terminal:
     - rollback list       -> See last 5 commits and backups
     - rollback 1 / 2      -> Instant rollback to version #1 or #2
@@ -24,6 +26,7 @@ import time
 import glob
 import json
 import signal
+import socket
 import hashlib
 import tempfile
 import threading
@@ -91,8 +94,14 @@ def get_file_hash(content: bytes) -> str:
 # 1. DYNAMIC BOT TOKEN RESOLUTION (CLOUD ENV vs LOCAL INTERACTIVE)
 # =========================================================================
 def get_bot_token():
-    # 1. Cloud / Docker: Check environment variable
+    # 1. Cloud / Docker: Check environment variables
     token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+    if not token:
+        # Check BOT_TOKENS (used by worker server.py)
+        raw_tokens = os.environ.get("BOT_TOKENS", "").strip()
+        if raw_tokens:
+            token = raw_tokens.split(",")[0].strip()
+
     if token:
         return token
 
@@ -544,23 +553,15 @@ def handle_cli(args):
     print("• rollback restart    ➔ Restart bot process\n")
 
 # =========================================================================
-# 7. PUBLIC WEB KEEP-ALIVE (PRIVACY-FIRST)
+# 7. DASHBOARD HTML & SMART REVERSE PROXY GATEWAY
 # =========================================================================
-class SafeHealthHandler(BaseHTTPRequestHandler):
-    def log_message(self, format, *args):
-        pass
+def get_dashboard_html():
+    uptime = int(time.time() - STATE["start_time"])
+    mins, secs = divmod(uptime, 60)
+    hrs, mins = divmod(mins, 60)
+    uptime_str = f"{hrs}h {mins}m {secs}s"
 
-    def do_GET(self):
-        self.send_response(200)
-        self.send_header("Content-type", "text/html; charset=utf-8")
-        self.end_headers()
-
-        uptime = int(time.time() - STATE["start_time"])
-        mins, secs = divmod(uptime, 60)
-        hrs, mins = divmod(mins, 60)
-        uptime_str = f"{hrs}h {mins}m {secs}s"
-
-        html = f"""<!DOCTYPE html>
+    return f"""<!DOCTYPE html>
 <html>
 <head>
     <title>Antigravity Service</title>
@@ -584,41 +585,115 @@ class SafeHealthHandler(BaseHTTPRequestHandler):
         <h2>Antigravity Cloud Engine</h2>
         <p>Supervisor watchdog is active. Cloud health check OK.</p>
         <div class="meta">
-            <div><strong>Status:</strong> <span style="color:#22c55e;">Running</span></div>
+            <div><strong>Status:</strong> <span style="color:#22c55e;">{STATE['status']}</span></div>
             <div><strong>Uptime:</strong> {uptime_str}</div>
+            <div><strong>Bot PID:</strong> {STATE['bot_pid'] or 'Starting'}</div>
             <div><strong>Watchdog:</strong> Crash-Proof Protected</div>
         </div>
         <div class="secure">🔒 Admin control managed via Telegram Terminal</div>
     </div>
 </body>
 </html>"""
-        self.wfile.write(html.encode("utf-8"))
 
-def run_http_server():
-    # 1. Allow disabling HTTP server via flag or env var
-    if "--no-http" in sys.argv or os.environ.get("NO_HTTP") == "1":
-        log("HTTP server disabled (running alongside main web service).")
-        return
+def pipe_sockets(s1, s2):
+    try:
+        while True:
+            data = s1.recv(32768)
+            if not data:
+                break
+            s2.sendall(data)
+    except Exception:
+        pass
+    finally:
+        try: s1.close()
+        except Exception: pass
+        try: s2.close()
+        except Exception: pass
 
-    # 2. Check if another main server script exists in the same directory (e.g. server.py, main.py)
-    # If another server exists, IT needs the main PORT (e.g. 10000). DO NOT steal it!
-    other_servers = ["server.py", "main.py"]
-    has_other_server = any(os.path.exists(s) or os.path.exists(os.path.join("/app", s)) for s in other_servers)
-
-    preferred_port = int(os.environ.get("PORT", 7860))
-    if has_other_server:
-        log("Detected existing main web server (server.py). Yielding main PORT to it.")
-        candidate_ports = [7860, 8080, 5000, 9000, 0]
-        if preferred_port in candidate_ports:
-            candidate_ports.remove(preferred_port)
-    else:
-        candidate_ports = [preferred_port, 7860, 8080, 5000, 0]
-
-    for p in candidate_ports:
+def run_smart_gateway(public_port, internal_port):
+    """Runs a smart TCP/HTTP gateway multiplexing /apm to dashboard and / to server.py"""
+    gw = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    gw.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    for p in [public_port, 10000, 7860, 8080, 0]:
         try:
-            server = HTTPServer(("0.0.0.0", p), SafeHealthHandler)
+            gw.bind(("0.0.0.0", p))
+            actual_port = gw.getsockname()[1]
+            gw.listen(128)
+            log(f"Smart Gateway active on port {actual_port} (/apm -> Dashboard, / -> server.py:{internal_port})")
+            break
+        except OSError:
+            continue
+
+    while True:
+        try:
+            client, _ = gw.accept()
+            threading.Thread(target=handle_gateway_client, args=(client, internal_port), daemon=True).start()
+        except Exception:
+            pass
+
+def handle_gateway_client(client, internal_port):
+    try:
+        peek = client.recv(1024, socket.MSG_PEEK)
+        first_line = peek.split(b"\r\n")[0] if b"\r\n" in peek else peek
+
+        # Check if route is /apm or related
+        if b" /apm" in first_line:
+            # Read full request headers
+            while b"\r\n\r\n" not in peek:
+                chunk = client.recv(1024)
+                if not chunk:
+                    break
+                peek += chunk
+            html_bytes = get_dashboard_html().encode("utf-8")
+            response = (
+                b"HTTP/1.1 200 OK\r\n"
+                b"Content-Type: text/html; charset=utf-8\r\n"
+                b"Content-Length: " + str(len(html_bytes)).encode() + b"\r\n"
+                b"Connection: close\r\n\r\n" + html_bytes
+            )
+            client.sendall(response)
+            client.close()
+            return
+
+        # Forward all other traffic (/, /socket.io, APIs, WebSockets) to internal server.py
+        backend = None
+        for _ in range(8):
+            try:
+                backend = socket.create_connection(("127.0.0.1", internal_port), timeout=2)
+                break
+            except Exception:
+                time.sleep(0.5)
+
+        if backend is None:
+            msg = b"HTTP/1.1 503 Service Unavailable\r\nRetry-After: 3\r\nContent-Length: 26\r\n\r\nBackend server starting..."
+            client.sendall(msg)
+            client.close()
+            return
+
+        threading.Thread(target=pipe_sockets, args=(client, backend), daemon=True).start()
+        threading.Thread(target=pipe_sockets, args=(backend, client), daemon=True).start()
+
+    except Exception:
+        try: client.close()
+        except Exception: pass
+
+class StandaloneHealthHandler(BaseHTTPRequestHandler):
+    def log_message(self, format, *args):
+        pass
+
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-type", "text/html; charset=utf-8")
+        self.end_headers()
+        self.wfile.write(get_dashboard_html().encode("utf-8"))
+
+def run_standalone_http():
+    preferred_port = int(os.environ.get("PORT", 10000))
+    for p in [preferred_port, 7860, 8080, 5000, 0]:
+        try:
+            server = HTTPServer(("0.0.0.0", p), StandaloneHealthHandler)
             actual_port = server.server_port
-            log(f"HTTP keep-alive active on port {actual_port} (Privacy Protected)")
+            log(f"Standalone HTTP keep-alive active on port {actual_port}")
             server.serve_forever()
             break
         except OSError:
@@ -669,9 +744,9 @@ exec python3 "{app_abs}" --cli "$@"
 def run_supervisor():
     global ACTIVE_PROCESS
     print("=" * 68)
-    print("  🚀 Antigravity Universal Supervisor & Anti-Rollback (apm.py)")
+    print("  🚀 Antigravity Universal Supervisor & Smart Gateway (apm.py)")
     print("  • Target: setupbot.py")
-    print("  • Public Privacy: Protected (No public buttons/downloads)")
+    print("  • Gateway: Multiplexes /apm & proxies / to server.py")
     print("  • Telegram Remote: 'rollback list', 'rollback 2', 'rollback dl'")
     print("  • Crash-Proof Server: Active (Main server will never fail)")
     print("  • Termux & Cloud Ready: 100% Standalone")
@@ -679,8 +754,49 @@ def run_supervisor():
 
     install_rollback_command()
 
-    http_thread = threading.Thread(target=run_http_server, daemon=True)
-    http_thread.start()
+    # 1. Custom Command via CLI: python apm.py --run "python my_script.py"
+    custom_cmd = None
+    if "--run" in sys.argv:
+        idx = sys.argv.index("--run")
+        if idx + 1 < len(sys.argv):
+            custom_cmd = sys.argv[idx + 1]
+
+    # 2. Custom Command via ENV: APP_CMD="python custom.py"
+    if not custom_cmd:
+        custom_cmd = os.environ.get("APP_CMD", "").strip()
+
+    # 3. Auto-detection of any common script name in current directory
+    server_script = None
+    if not custom_cmd:
+        this_file = os.path.basename(__file__)
+        common_candidates = ["server.py", "main.py", "app.py", "run.py", "web.py", "api.py", "index.py", "bot.py"]
+        for cand in common_candidates:
+            if cand != this_file and os.path.exists(cand):
+                server_script = cand
+                break
+
+    public_port = int(os.environ.get("PORT", 10000))
+    internal_port = 8000
+
+    if custom_cmd or server_script:
+        target_cmd = custom_cmd if custom_cmd else f"{sys.executable} {server_script}"
+        log(f"Detected main service: '{target_cmd}'. Launching on internal port {internal_port}...")
+        s_env = os.environ.copy()
+        s_env["PORT"] = str(internal_port)
+        s_env["PYTHONUNBUFFERED"] = "1"
+        try:
+            subprocess.Popen(target_cmd, shell=True, env=s_env)
+            log(f"🟢 '{target_cmd}' running on internal port {internal_port}")
+        except Exception as se:
+            log(f"⚠️ Error starting '{target_cmd}': {se}")
+
+        # Start smart gateway on public port (10000)
+        http_thread = threading.Thread(target=run_smart_gateway, args=(public_port, internal_port), daemon=True)
+        http_thread.start()
+    else:
+        # Standalone mode: normal HTTP server
+        http_thread = threading.Thread(target=run_standalone_http, daemon=True)
+        http_thread.start()
 
     log(f"Setupbot path: {SETUPBOT_PATH}")
     fetch_and_check_latest_gist()
