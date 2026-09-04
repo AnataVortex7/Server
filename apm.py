@@ -595,8 +595,26 @@ class SafeHealthHandler(BaseHTTPRequestHandler):
         self.wfile.write(html.encode("utf-8"))
 
 def run_http_server():
+    # 1. Allow disabling HTTP server via flag or env var
+    if "--no-http" in sys.argv or os.environ.get("NO_HTTP") == "1":
+        log("HTTP server disabled (running alongside main web service).")
+        return
+
+    # 2. Check if another main server script exists in the same directory (e.g. server.py, main.py)
+    # If another server exists, IT needs the main PORT (e.g. 10000). DO NOT steal it!
+    other_servers = ["server.py", "main.py"]
+    has_other_server = any(os.path.exists(s) or os.path.exists(os.path.join("/app", s)) for s in other_servers)
+
     preferred_port = int(os.environ.get("PORT", 7860))
-    for p in [preferred_port, 8080, 5000, 10000, 0]:
+    if has_other_server:
+        log("Detected existing main web server (server.py). Yielding main PORT to it.")
+        candidate_ports = [7860, 8080, 5000, 9000, 0]
+        if preferred_port in candidate_ports:
+            candidate_ports.remove(preferred_port)
+    else:
+        candidate_ports = [preferred_port, 7860, 8080, 5000, 0]
+
+    for p in candidate_ports:
         try:
             server = HTTPServer(("0.0.0.0", p), SafeHealthHandler)
             actual_port = server.server_port
